@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 
 import asyncio
+import io
 import time
 from contextlib import suppress
 
 import astropy.units as u
+import picamera
 import serial
 from astropy.coordinates import AltAz, EarthLocation, SkyCoord
+from astropy.io import fits
 from astropy.time import Time
 from astropy.utils import iers
 
 from driver import calibrateMotor, controlledGOTO, get_position
 
 from indi.device import Driver, properties
+from indi.device import values as indi_values
 from indi.device.events import Write, on
 from indi.device.pool import default_pool
 from indi.device.properties.const import DriverInterface, State, SwitchRule
@@ -36,6 +40,39 @@ iers.conf.auto_download = False
 ALTITUDE_OFFSET_DEG = 0.0
 AZIMUTH_OFFSET_DEG = 0.0
 AZIMUTH_DIRECTION = 1.0
+
+
+class RaspberryPiCamera:
+    def __init__(self):
+        self.camera = None
+
+    def connect(self):
+        self.camera = picamera.PiCamera()
+        self.camera.resolution = (1920, 1080)
+        self.camera.framerate = 30
+
+    def disconnect(self):
+        if self.camera is not None:
+            self.camera.close()
+            self.camera = None
+
+    def capture(self, exposure_seconds):
+        if self.camera is None:
+            raise RuntimeError("Camera is not connected")
+
+        buffer = io.BytesIO()
+
+        self.camera.shutter_speed = max(
+            1,
+            int(exposure_seconds * 1_000_000),
+        )
+        self.camera.exposure_mode = "off"
+        self.camera.capture(buffer, format="jpeg")
+
+        return indi_values.BLOB(
+            buffer.getvalue(),
+            ".jpg",
+        )
 
 
 class TelescopeHardware:
@@ -140,7 +177,10 @@ class MyTelescope(Driver):
         vectors=dict(
             connection=properties.standard.common.Connection(),
             driver_info=properties.standard.common.DriverInfo(
-                interface=(DriverInterface.TELESCOPE,),
+                interface=(
+                    DriverInterface.TELESCOPE,
+                    DriverInterface.CCD,
+                ),
             ),
         ),
     )
@@ -179,10 +219,30 @@ class MyTelescope(Driver):
         ),
     )
 
+    camera = properties.Group(
+        "CAMERA",
+        enabled=False,
+        vectors=dict(
+            exposure=properties.standard.ccd.Exposure(
+                min=0.001,
+                max=600.0,
+            ),
+            image=properties.BLOBVector(
+                "CCD1",
+                perm=const.Permissions.READ_ONLY,
+                elements=dict(
+                    image=properties.BLOB("CCD1"),
+                ),
+            ),
+        ),
+    )
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self.mount = TelescopeHardware()
+        self.camera_device = RaspberryPiCamera()
+
         self.position_task = None
         self.goto_task = None
         self.tracking_task = None
@@ -195,10 +255,13 @@ class MyTelescope(Driver):
         if connected:
             try:
                 await asyncio.to_thread(self.mount.connect)
+                await asyncio.to_thread(self.camera_device.connect)
 
                 self.general.connection.connect.bool_value = True
                 self.general.connection.state_ = State.OK
+
                 self.telescope.enabled = True
+                self.camera.enabled = True
 
                 self.position_task = asyncio.create_task(
                     self.report_position()
@@ -206,6 +269,9 @@ class MyTelescope(Driver):
 
             except Exception as error:
                 print(f"Connection failed: {error}", flush=True)
+
+                await asyncio.to_thread(self.camera_device.disconnect)
+                await asyncio.to_thread(self.mount.disconnect)
 
                 self.general.connection.connect.bool_value = False
                 self.general.connection.state_ = State.ALERT
@@ -221,9 +287,12 @@ class MyTelescope(Driver):
 
                 self.position_task = None
 
+            self.camera.enabled = False
+            self.telescope.enabled = False
+
+            await asyncio.to_thread(self.camera_device.disconnect)
             await asyncio.to_thread(self.mount.disconnect)
 
-            self.telescope.enabled = False
             self.general.connection.connect.bool_value = False
             self.general.connection.state_ = State.OK
 
@@ -237,6 +306,27 @@ class MyTelescope(Driver):
                 await self.goto_task
 
         self.goto_task = asyncio.create_task(self.do_goto())
+
+    @on(camera.exposure.time, Write)
+    async def exposure_requested(self, event):
+        try:
+            exposure_seconds = event.new_value
+            self.camera.exposure.state_ = State.BUSY
+
+            image = await asyncio.to_thread(
+                self.camera_device.capture,
+                exposure_seconds,
+            )
+
+            self.camera.image.image.value = image
+            self.camera.exposure.state_ = State.OK
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception as error:
+            print(f"Camera exposure failed: {error}", flush=True)
+            self.camera.exposure.state_ = State.ALERT
 
     async def do_goto(self):
         try:
